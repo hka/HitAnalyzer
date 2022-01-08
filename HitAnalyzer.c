@@ -3,9 +3,32 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <assert.h>
 
 #include "parg.h"
 #include "SDL.h"
+
+//----------------- Structs -----------------------------
+struct settings
+{
+  int32_t selected_device_id;
+  SDL_AudioSpec actualAudioSpec;
+
+  bool enable_visualization;
+};
+
+struct state
+{
+  struct settings opt;
+
+  SDL_Window* window;
+  SDL_Renderer* renderer;
+  int32_t window_width;
+  int32_t window_height;
+  int32_t draw_col;
+  double* col_data;
+};
+//-------------------------------------------------------
 
 void list_recording_device()
 {
@@ -30,20 +53,19 @@ void print_selected_device_name(int32_t id)
   }
 }
 
-struct settings
-{
-  int32_t selected_device_id;
-};
-
 void parse_options(int argc, char* argv[],
 		   struct settings* cmd_arg)
 {
+  //default init cmd_arg
+  cmd_arg->selected_device_id = 0;
+  cmd_arg->enable_visualization = false;
+  
   // Parse command line args
   struct parg_state ps;
   int32_t option; 
   parg_init(&ps);
 
-    while((option = parg_getopt(&ps, argc, argv, "hs:vld:")) != -1)
+  while((option = parg_getopt(&ps, argc, argv, "hs:vld:r")) != -1)
   {
     switch(option)
     {
@@ -62,6 +84,10 @@ void parse_options(int argc, char* argv[],
       {
 	printf("option -s with argument '%s'\n", ps.optarg);
 	break;
+      }
+      case 'r':
+      {
+	cmd_arg->enable_visualization = true;
       }
       case 'l':
       {
@@ -123,27 +149,99 @@ void parse_options(int argc, char* argv[],
 
 void fillAudioBuffer(void *userdata, uint8_t *stream, int32_t len)
 {
-  //take care of configured sample type! here I assume it is AUDIO_S16
-  int16_t* buffer = (int16_t*)stream;
-  double val = 0;
-  int i = 0;
-  for(i=0; i < len/2; ++i)
+  struct state* prog_state = (struct state*)userdata;
+  struct settings* opt = &prog_state->opt;
+  SDL_AudioSpec* audio_spec = &opt->actualAudioSpec;
+  
+  assert(AUDIO_S16SYS == audio_spec->format);
+
+  int32_t  sample_freq  = audio_spec->freq;
+  uint16_t sample_count = audio_spec->samples;
+  int16_t* samples = (int16_t*)stream;
+
+  //Downsample to something more reasonable for our application
+  //moving average filter and then decimate
+  //good signal in time domain, but bad in frequency!
+  //if we need to do dft, use windowed sinc-filter instead
+
+  //world record is somewhere around 1200 bpm, 20 Hz
+  int32_t target_freq = 1000;
+  
+  double duration_ms = ((double)sample_count / sample_freq)*1000;
+
+  int32_t distance_between_samples = sample_freq/target_freq;
+  int32_t first_sample_ix = distance_between_samples/2;
+
+  int32_t window_size = 11 < distance_between_samples ? 11 : distance_between_samples;
+  int32_t half_window = (window_size - 1)/2;
+
+  double amp_buf[1024];
+  size_t buf_ix = 0;
+  
+  int32_t i = first_sample_ix - half_window;
+  int32_t j;
+  for(;
+      i + window_size < sample_count;
+      i += distance_between_samples)
   {
-    double sample = (double)buffer[i];
-    double amplitude = (sample < 0 ? sample / INT16_MIN : sample / INT16_MAX);
-    double db =(amplitude == 0.0 ? 0 : 20*log10(amplitude));
-    val += db;
+    amp_buf[buf_ix] = 0;
+    for(j = i; j < i + window_size; ++j)
+    {
+      double sample = (double)samples[j];
+      double amplitude = (sample < 0 ? sample / INT16_MIN : sample / INT16_MAX);
+      amp_buf[buf_ix] += amplitude;
+    }
+    amp_buf[buf_ix] /= window_size;
+    ++buf_ix;
+    //double db = 20*log10(amplitude); //how to handle amplitude == 0? set amplitude to 1/INT16_MAX ?
+
   }
-  val = val/(len/2);
-  printf("Callback at %u, %d samples, %f\n", SDL_GetTicks(),len, val);
+  printf("Callback at %u, %d samples\n", SDL_GetTicks(),sample_count);
+
+  //draw stuff
+  if(opt->enable_visualization)
+  {
+    SDL_SetRenderDrawColor(prog_state->renderer, 0xFF, 0xFF, 0xFF, 0xFF);
+    for(i = 0; i < buf_ix; ++i)
+    {
+      if(prog_state->draw_col >= prog_state->window_width)
+      {
+	SDL_SetRenderDrawColor(prog_state->renderer, 0x00, 0x00, 0x00, 0x00);
+	SDL_RenderClear(prog_state->renderer);
+	SDL_SetRenderDrawColor(prog_state->renderer, 0xFF, 0xFF, 0xFF, 0xFF);
+	prog_state->draw_col = 0;
+      }
+      int32_t ix = prog_state->draw_col;
+
+      prog_state->col_data[ix] = amp_buf[i];
+      int16_t draw_value = (int16_t)(amp_buf[i]*prog_state->window_height);
+
+      if(ix == 0)
+      {
+	SDL_RenderDrawPoint(prog_state->renderer,ix , draw_value);
+      }
+      else
+      {
+	int16_t y1 = (int16_t)(prog_state->col_data[ix-1]*prog_state->window_height);
+	  
+	SDL_RenderDrawLine(prog_state->renderer, ix-1, y1, ix, draw_value);
+      }
+      prog_state->draw_col += 1;
+    }
+    SDL_RenderPresent(prog_state->renderer);
+  }
+
 }
 
-void init_audio_device(SDL_AudioDeviceID* dev, int32_t deviceId)
+void init_audio_device(SDL_AudioDeviceID* dev, struct state* prog_state)
 {
+  struct settings* opt = &prog_state->opt;
+  int32_t device_id = opt->selected_device_id;
+  
 #ifdef NEW_SDL //need atleast sdl 2.0.16
   SDL_AudioSpec preferredAudioSpec;
   int32_t ret;
-  ret = SDL_GetAudioDeviceSpec(deviceId, 1, &preferredAudioSpec);
+  ret = SDL_GetAudioDeviceSpec(device_id, 1, &preferredAudioSpec);
   if(0 != ret)
   {
     // Could not get preferred audio spec
@@ -152,20 +250,18 @@ void init_audio_device(SDL_AudioDeviceID* dev, int32_t deviceId)
   
   SDL_AudioSpec requestedAudioSpec;
   SDL_zero(requestedAudioSpec);
-  requestedAudioSpec.freq = 44100;
+  requestedAudioSpec.freq = 48000;
   requestedAudioSpec.format = AUDIO_S16SYS;
   requestedAudioSpec.channels = 1;
   requestedAudioSpec.samples = 1024;
   requestedAudioSpec.callback = fillAudioBuffer;
-  //requestedAudioSpec.userdata = gameData; //todo send in struct with format info etc
+  requestedAudioSpec.userdata = prog_state;
   
-  SDL_AudioSpec actualAudioSpec;
-
-  *dev = SDL_OpenAudioDevice(SDL_GetAudioDeviceName(deviceId, 1), 1,
+  *dev = SDL_OpenAudioDevice(SDL_GetAudioDeviceName(device_id, 1), 1,
 			     &requestedAudioSpec,
-			     &actualAudioSpec, 0);
+			     &opt->actualAudioSpec, 0);
 
-  if (requestedAudioSpec.format != actualAudioSpec.format)
+  if (requestedAudioSpec.format != opt->actualAudioSpec.format)
   {
     printf("We didn't get the wanted format.");
     return; //error code
@@ -180,30 +276,74 @@ void init_audio_device(SDL_AudioDeviceID* dev, int32_t deviceId)
 
 int main(int argc, char *argv[])
 {
-  if (SDL_Init(/*SDL_INIT_VIDEO |*/ SDL_INIT_AUDIO) != 0)
+  if (SDL_Init(SDL_INIT_AUDIO) != 0)
   {
     printf("Unable to initialize SDL: %s\n", SDL_GetError());
     return EXIT_FAILURE;
   }
-  
-  struct settings cmd_arg;
-  parse_options(argc, argv, &cmd_arg);
+
+  struct state prog_state = {0};
+  parse_options(argc, argv, &prog_state.opt);
 
   //Setup recording device
-  print_selected_device_name(cmd_arg.selected_device_id);
+  print_selected_device_name(prog_state.opt.selected_device_id);
   SDL_AudioDeviceID dev;
-  init_audio_device(&dev, cmd_arg.selected_device_id);
+  init_audio_device(&dev, &prog_state);
 
+  //Setup visualization if enabled
+  if(prog_state.opt.enable_visualization)
+  {
+    //The window we'll be rendering to
+    prog_state.window = NULL;
+    
+    //The surface contained by the window
+    SDL_Surface* screenSurface = NULL;
+
+    //Initialize SDL
+    if( SDL_Init( SDL_INIT_VIDEO ) < 0 )
+    {
+      printf( "SDL could not initialize! SDL_Error: %s\n", SDL_GetError() );
+    }
+    else
+    {
+      prog_state.draw_col = 0;
+      prog_state.window_width  = 1000;
+      prog_state.window_height = 255;
+      prog_state.col_data = (double*)malloc(sizeof(double)* prog_state.window_width);
+      const int32_t width  = prog_state.window_width;
+      const int32_t height = prog_state.window_height;
+      //Create window and renderer
+      SDL_CreateWindowAndRenderer(width, height, 0,
+				  &prog_state.window,
+				  &prog_state.renderer);
+      if( prog_state.window == NULL )
+      {
+	printf( "Window could not be created! SDL_Error: %s\n", SDL_GetError() );
+      }
+    }
+  }//if enable_visualization
+  
   //Start sampling
   SDL_PauseAudioDevice(dev, 0);
 
   //Sample for some time
   // SDL_GetTicks64 give ms since start as Uint64, but need sdl 2.0.18 or newer, I have 2.0.8 as system version
-  //printf("Started at %u\n", SDL_GetTicks());
-  //SDL_Delay(5000);
+  printf("Started at %u\n", SDL_GetTicks());
+  SDL_Delay(5000);
+  SDL_Delay(5000);
   
   //Clean up
   SDL_CloseAudioDevice(dev);
+  if(prog_state.opt.enable_visualization)
+  {
+    SDL_DestroyWindow( prog_state.window );
+    SDL_DestroyRenderer(prog_state.renderer);
+    if(prog_state.col_data != NULL)
+    {
+      free(prog_state.col_data);
+    }
+  }
+  SDL_Quit();
   
   return EXIT_SUCCESS;
 }
