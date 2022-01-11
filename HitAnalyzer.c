@@ -147,7 +147,59 @@ void parse_options(int argc, char* argv[],
   }
 }
 
-void fillAudioBuffer(void *userdata, uint8_t *stream, int32_t len)
+void clear_render(SDL_Renderer* renderer)
+{
+  SDL_SetRenderDrawColor(renderer, 0x00, 0x00, 0x00, 0xFF);
+  SDL_RenderClear(renderer);
+}
+
+int32_t to_window_scale(double value, int32_t height)
+{
+  return (int32_t)((1-value)*height + 0.5);
+}
+
+void add_to_draw(double* amplitude, size_t count, struct state* prog_state)
+{
+  size_t i = 0;
+  double* draw_buffer = prog_state->col_data;
+  int32_t ix = prog_state->draw_col;
+  int32_t n = prog_state->window_width;
+  for(i = 0; i < count; ++i)
+  {
+    draw_buffer[ix%n] = amplitude[i];
+    ++ix;
+  }
+  prog_state->draw_col = ix%n;
+}
+
+void render_amplitude(struct state* prog_state)
+{
+  clear_render(prog_state->renderer);
+  
+  SDL_SetRenderDrawColor(prog_state->renderer, 0xFF, 0xFF, 0xFF, 0xFF);
+
+  size_t i = 0;
+  double* draw_buffer = prog_state->col_data;
+  int32_t ix = prog_state->draw_col;
+  int32_t n = prog_state->window_width;
+  ix = ix+1;
+
+  int32_t height = prog_state->window_height;
+  
+  for(i = 0; i+1 < n; ++i)
+  {
+    int32_t y0 = to_window_scale(draw_buffer[ix%n],height);
+    int32_t y1 = to_window_scale(draw_buffer[(ix+1)%n],height);
+    int32_t x0 = (int32_t)i;
+    int32_t x1 = x0+1;
+    SDL_RenderDrawLine(prog_state->renderer, x0, y0, x1, y1);
+    //SDL_RenderDrawPoint(prog_state->renderer, x0, y0);
+    ++ix;
+  }
+  SDL_RenderPresent(prog_state->renderer);
+}
+
+void processAudioBuffer(void *userdata, uint8_t *stream, int32_t len)
 {
   struct state* prog_state = (struct state*)userdata;
   struct settings* opt = &prog_state->opt;
@@ -196,43 +248,15 @@ void fillAudioBuffer(void *userdata, uint8_t *stream, int32_t len)
     //double db = 20*log10(amplitude); //how to handle amplitude == 0? set amplitude to 1/INT16_MAX ?
 
   }
-  printf("Callback at %u, %d samples\n", SDL_GetTicks(),sample_count);
 
-  //draw stuff
   if(opt->enable_visualization)
   {
-    SDL_SetRenderDrawColor(prog_state->renderer, 0xFF, 0xFF, 0xFF, 0xFF);
-    for(i = 0; i < buf_ix; ++i)
-    {
-      if(prog_state->draw_col >= prog_state->window_width)
-      {
-	SDL_SetRenderDrawColor(prog_state->renderer, 0x00, 0x00, 0x00, 0x00);
-	SDL_RenderClear(prog_state->renderer);
-	SDL_SetRenderDrawColor(prog_state->renderer, 0xFF, 0xFF, 0xFF, 0xFF);
-	prog_state->draw_col = 0;
-      }
-      int32_t ix = prog_state->draw_col;
-
-      prog_state->col_data[ix] = amp_buf[i];
-      int16_t draw_value = (int16_t)(amp_buf[i]*prog_state->window_height);
-
-      if(ix == 0)
-      {
-	SDL_RenderDrawPoint(prog_state->renderer,ix , draw_value);
-      }
-      else
-      {
-	int16_t y1 = (int16_t)(prog_state->col_data[ix-1]*prog_state->window_height);
-	  
-	SDL_RenderDrawLine(prog_state->renderer, ix-1, y1, ix, draw_value);
-      }
-      prog_state->draw_col += 1;
-    }
-    SDL_RenderPresent(prog_state->renderer);
+    add_to_draw(amp_buf, buf_ix, prog_state);
+    render_amplitude(prog_state);
   }
-
 }
 
+//----------------- I N I T ----------------------------
 void init_audio_device(SDL_AudioDeviceID* dev, struct state* prog_state)
 {
   struct settings* opt = &prog_state->opt;
@@ -254,7 +278,7 @@ void init_audio_device(SDL_AudioDeviceID* dev, struct state* prog_state)
   requestedAudioSpec.format = AUDIO_S16SYS;
   requestedAudioSpec.channels = 1;
   requestedAudioSpec.samples = 1024;
-  requestedAudioSpec.callback = fillAudioBuffer;
+  requestedAudioSpec.callback = processAudioBuffer;
   requestedAudioSpec.userdata = prog_state;
   
   *dev = SDL_OpenAudioDevice(SDL_GetAudioDeviceName(device_id, 1), 1,
@@ -272,6 +296,37 @@ void init_audio_device(SDL_AudioDeviceID* dev, struct state* prog_state)
     return; //error code
   }
   return; //success
+}
+
+void init_visualization(struct state* prog_state)
+{
+  prog_state->window = NULL;
+    
+  if( SDL_Init( SDL_INIT_VIDEO ) < 0 )
+  {
+    printf( "SDL could not initialize! SDL_Error: %s\n", SDL_GetError() );
+    return; //fail code
+  }
+  else
+  {
+    prog_state->draw_col = 0;
+    prog_state->window_width  = 1000;
+    prog_state->window_height = 255;
+    prog_state->col_data = (double*)calloc(prog_state->window_width, sizeof(double));
+    const int32_t width  = prog_state->window_width;
+    const int32_t height = prog_state->window_height;
+    //Create window and renderer
+    SDL_CreateWindowAndRenderer(width, height, 0,
+				&prog_state->window,
+				&prog_state->renderer);
+    if(    prog_state->window == NULL
+	|| prog_state->renderer == NULL)
+    {
+      printf( "Window and renderer could not be created! SDL_Error: %s\n", SDL_GetError() );
+      return;
+    }
+  }
+  return;
 }
 
 int main(int argc, char *argv[])
@@ -293,34 +348,7 @@ int main(int argc, char *argv[])
   //Setup visualization if enabled
   if(prog_state.opt.enable_visualization)
   {
-    //The window we'll be rendering to
-    prog_state.window = NULL;
-    
-    //The surface contained by the window
-    SDL_Surface* screenSurface = NULL;
-
-    //Initialize SDL
-    if( SDL_Init( SDL_INIT_VIDEO ) < 0 )
-    {
-      printf( "SDL could not initialize! SDL_Error: %s\n", SDL_GetError() );
-    }
-    else
-    {
-      prog_state.draw_col = 0;
-      prog_state.window_width  = 1000;
-      prog_state.window_height = 255;
-      prog_state.col_data = (double*)malloc(sizeof(double)* prog_state.window_width);
-      const int32_t width  = prog_state.window_width;
-      const int32_t height = prog_state.window_height;
-      //Create window and renderer
-      SDL_CreateWindowAndRenderer(width, height, 0,
-				  &prog_state.window,
-				  &prog_state.renderer);
-      if( prog_state.window == NULL )
-      {
-	printf( "Window could not be created! SDL_Error: %s\n", SDL_GetError() );
-      }
-    }
+    init_visualization(&prog_state);
   }//if enable_visualization
   
   //Start sampling
@@ -328,9 +356,19 @@ int main(int argc, char *argv[])
 
   //Sample for some time
   // SDL_GetTicks64 give ms since start as Uint64, but need sdl 2.0.18 or newer, I have 2.0.8 as system version
-  printf("Started at %u\n", SDL_GetTicks());
+  //printf("Started at %u\n", SDL_GetTicks());
   SDL_Delay(5000);
+/*
+  SDL_PauseAudioDevice(dev, 1);
+  if(prog_state.opt.enable_visualization)
+  {
+    render_amplitude(&prog_state);
+  }
+  SDL_PauseAudioDevice(dev, 0);
+*/
   SDL_Delay(5000);
+
+
   
   //Clean up
   SDL_CloseAudioDevice(dev);
