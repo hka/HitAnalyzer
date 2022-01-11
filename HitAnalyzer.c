@@ -354,22 +354,35 @@ int main(int argc, char *argv[])
   //Start sampling
   SDL_PauseAudioDevice(dev, 0);
 
-  //Sample for some time
-  // SDL_GetTicks64 give ms since start as Uint64, but need sdl 2.0.18 or newer, I have 2.0.8 as system version
-  //printf("Started at %u\n", SDL_GetTicks());
-  SDL_Delay(5000);
-/*
-  SDL_PauseAudioDevice(dev, 1);
   if(prog_state.opt.enable_visualization)
   {
-    render_amplitude(&prog_state);
-  }
-  SDL_PauseAudioDevice(dev, 0);
-*/
-  SDL_Delay(5000);
-
-
+    bool quit = false;
+    SDL_Event e;
   
+    while(!quit)
+    {
+      while( SDL_PollEvent( &e ) != 0 )
+      {
+	if( e.type == SDL_QUIT )
+	{
+	  quit = true;
+	}
+	else if( e.type == SDL_KEYDOWN )
+	{
+	  if(e.key.keysym.sym == SDLK_q)
+	  {
+	    quit = true;
+	  }
+	}
+      }
+      SDL_Delay(100);
+    }
+  }
+  else
+  {
+    SDL_Delay(5000);
+  }
+
   //Clean up
   SDL_CloseAudioDevice(dev);
   if(prog_state.opt.enable_visualization)
